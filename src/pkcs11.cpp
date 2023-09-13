@@ -7,13 +7,6 @@
 #include <device_register.h>
 #include <libp11.h>
 
-#define leave \
-({ cerr << "Error !"<< endl; \
-   cerr << " Commit: " << GIT_COMMIT << endl; \
-   cerr << " File: pkcs11.cpp, Func: " << __func__ \
-   << " Line: " << __LINE__ << endl; \
-   return -1; })
-
 /* HSM default information */
 static const struct lmp_hsm {
 	string token;
@@ -244,6 +237,8 @@ int pkcs11_create_csr(const lmp_options &opt, string &pkey, string &csr)
 	EVP_PKEY *pub = NULL;
 	unsigned int nslots = 0;
 	unsigned int n = 0;
+	int ret = 0;
+	bool created_keys = false;
 	PKCS11_EC_KGEN ec = {
 		.curve = "P-256",
 	};
@@ -263,10 +258,10 @@ again:
 	ctx = PKCS11_CTX_new();
 
 	if (PKCS11_CTX_load(ctx, opt.hsm_module.c_str()))
-		leave;
+		leave_exit;
 
 	if (PKCS11_enumerate_slots(ctx, &slots, &nslots))
-		leave;
+		leave_exit;
 
 	slot = PKCS11_find_token(ctx, slots, nslots);
 
@@ -281,28 +276,29 @@ again:
 			PKCS11_CTX_free(ctx);
 
 			if (pkcs11_initialize(opt))
-				leave;
+				leave_exit;
 
 			init = true;
 			goto again;
 		}
 		cout << "PKCS11 token not found after initializing" << endl;
-		leave;
+		leave_exit;
 	} else {
 		cout << "PKCS11 token " << HSM_TOKEN_STR << " found" << endl;
 	}
 
 	if (PKCS11_open_session(slot, 1))
-		leave;
+		leave_exit;
 
 	if (PKCS11_login(slot, 0, opt.hsm_pin.c_str()))
-		leave;
+		leave_exit;
 
+	created_keys = true;
 	if (PKCS11_generate_key(slot->token, &attr))
-		leave;
+		leave_exit;
 
 	if (PKCS11_enumerate_public_keys(slot->token, &key, &n) || !n)
-		leave;
+		leave_exit;
 
 	for ( ; !pub && key && n; key++, n--) {
 		if (key->label == hsm_cfg.tls_lbl)
@@ -310,10 +306,10 @@ again:
 	}
 
 	if (!pub)
-		leave;
+		leave_exit;
 
 	if (PKCS11_enumerate_keys(slot->token, &key, &n) || !n)
-		leave;
+		leave_exit;
 
 	for ( ; !prv && key && n; key++, n--) {
 		if (key->label == hsm_cfg.tls_lbl)
@@ -321,27 +317,36 @@ again:
 	}
 
 	if (!prv)
-		leave;
-
-	if (PKCS11_logout(slot))
-		leave;
+		leave_exit;
 
 	/* Use OpenSSL to generate the request in the csr buffer */
 	if (openssl_gen_csr(opt, pub, prv, csr))
-		leave;
+		leave_exit;
 
 	pkey = hsm_cfg.tls_id;
+
+exit:
+	/* Cleanup the generated key pair in case of errors */
+	if (created_keys && ret)
+		remove_keys(slot->token, hsm_cfg.tls_lbl);
+
+	if (slot) {
+		if (PKCS11_logout(slot))
+			ret = -1;
+	}
 
 	/* Free the keys */
 	EVP_PKEY_free(pub);
 	EVP_PKEY_free(prv);
 
 	/* Release context */
-	PKCS11_release_all_slots(ctx, slots, nslots);
-	PKCS11_CTX_unload(ctx);
-	PKCS11_CTX_free(ctx);
+	if (ctx) {
+		PKCS11_release_all_slots(ctx, slots, nslots);
+		PKCS11_CTX_unload(ctx);
+		PKCS11_CTX_free(ctx);
+	}
 
-	return 0;
+	return ret;
 }
 
 /* Write a PEM cerficate in the PKCS#11 database (secure storage - ie RPMB ) */
@@ -351,14 +356,16 @@ int pkcs11_store_cert(lmp_options &opt, X509 *cert)
 	PKCS11_SLOT *slot = NULL;
 	PKCS11_CTX *ctx = NULL;
 	unsigned int nslots = 0;
+	bool stored_cert = false;
+	int ret = 0;
 
 	ctx = PKCS11_CTX_new();
 
 	if (PKCS11_CTX_load(ctx, opt.hsm_module.c_str()))
-		leave;
+		leave_exit;
 
 	if (PKCS11_enumerate_slots(ctx, &slots, &nslots))
-		leave;
+		leave_exit;
 
 	slot = PKCS11_find_token(ctx, slots, nslots);
 
@@ -366,18 +373,24 @@ int pkcs11_store_cert(lmp_options &opt, X509 *cert)
 		slot = PKCS11_find_next_token(ctx, slots, nslots, slot);
 
 	if (!slot || slot->token->label != hsm_cfg.token)
-		leave;
+		leave_exit;
 
 	if (PKCS11_open_session(slot, 1))
-		leave;
+		leave_exit;
 
 	if (PKCS11_login(slot, 0, opt.hsm_pin.c_str()))
-		leave;
+		leave_exit;
 
+	stored_cert = true;
 	if (PKCS11_store_certificate(slot->token, cert, (char *)HSM_CRT_STR,
 				     (unsigned char *)&hsm_cfg.crt_id,
 				     sizeof(hsm_cfg.crt_id), NULL))
-		leave;
+		leave_exit;
+
+exit:
+	/* Cleanup the stored cert in case of errors */
+	if (stored_cert && ret)
+		remove_certs(slot->token, hsm_cfg.crt_lbl);
 
 	if (PKCS11_logout(slot))
 		leave;
@@ -388,7 +401,7 @@ int pkcs11_store_cert(lmp_options &opt, X509 *cert)
 	PKCS11_CTX_unload(ctx);
 	PKCS11_CTX_free(ctx);
 
-	return 0;
+	return ret;
 }
 
 static int check_hsm_objects(lmp_options &opt, PKCS11_SLOT *slot)
@@ -468,7 +481,7 @@ int pkcs11_check_hsm(lmp_options &opt)
 	return ret;
 }
 
-int pkcs11_remove_keys(lmp_options &opt)
+int pkcs11_remove_objects(lmp_options &opt)
 {
 	PKCS11_SLOT *slots = NULL;
 	PKCS11_SLOT *slot = NULL;
@@ -503,6 +516,7 @@ int pkcs11_remove_keys(lmp_options &opt)
 		leave;
 
 	remove_keys(slot->token, hsm_cfg.tls_lbl);
+	remove_certs(slot->token, hsm_cfg.tls_lbl);
 
 	if (PKCS11_logout(slot))
 		leave;

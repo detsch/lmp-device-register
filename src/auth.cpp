@@ -10,6 +10,17 @@
 namespace b64 = boost::beast::detail::base64;
 using boost::property_tree::ptree;
 
+static void dump_resp_error(string message, gint64 code, ptree resp)
+{
+	cerr << message << ": HTTP_" << code << endl;
+	if (resp.data().length())
+		cerr << resp.data() << endl;
+
+	for (auto it: resp)
+		cerr << it.first << ": " << it.second.data() << endl;
+}
+
+/* Returns the access_token on success, and empty string on errors */
 static string get_oauth_token(const string &factory, const string &device_uuid)
 {
 	const char *env = getenv(ENV_OAUTH_BASE);
@@ -22,12 +33,13 @@ static string get_oauth_token(const string &factory, const string &device_uuid)
 	url = env == nullptr ? OAUTH_API : env;
 
 	data = "client_id=" + device_uuid;
-	data += "&scope=" + factory + ":devices:create";
+	data += "&scope=" + factory + ":devices:create " + factory + ":devices:read-update "
+	        + factory + ":devices:delete ";
 
 	gint64 code = Curl(url + "/authorization/device/").Post(headers, data, json);
 	if (code != 200) {
-		cerr << "Unable to create device authorization request: HTTP_" << code << endl;
-		exit(EXIT_FAILURE);
+		dump_resp_error("Unable to create device authorization request", code, json);
+		return "";
 	}
 
 	cout << endl;
@@ -42,7 +54,8 @@ static string get_oauth_token(const string &factory, const string &device_uuid)
 	data = "grant_type=urn:ietf:params:oauth:grant-type:device_code";
 	data += "&device_code=" + json.get<string>("device_code");
 	data += "&client_id=" + device_uuid;
-	data += "&scope=" + factory + ":devices:create";
+	data += "&scope=" + factory + ":devices:create " + factory + ":devices:read-update "
+	        + factory + ":devices:delete ";
 
 	string msg;
 	int i = 0;
@@ -66,9 +79,8 @@ static string get_oauth_token(const string &factory, const string &device_uuid)
 			cout << WHEELS[i++ % sizeof(WHEELS)] << "\r" << std::flush;
 			sleep(interval);
 		} else {
-			cerr << "Error authorizing device: ";
-			cerr << json.get<string>("error_description") << endl;
-			exit(EXIT_FAILURE);
+			dump_resp_error("Error authorizing device", code, json);
+			return "";
 		}
 	}
 }
@@ -77,11 +89,11 @@ static string get_oauth_token(const string &factory, const string &device_uuid)
  * Headers of a request to the device registration endpoint DEVICE_API
  * Default https://api.foundries.io/ota/devices/
  */
-void auth_get_http_headers(lmp_options &opt, http_headers &headers)
+int auth_get_http_headers(lmp_options &opt, http_headers &headers)
 {
 	if (!opt.api_token.empty()) {
 		headers[opt.api_token_header] = opt.api_token;
-		return;
+		return 0;
 	}
 
 	/*
@@ -91,14 +103,18 @@ void auth_get_http_headers(lmp_options &opt, http_headers &headers)
 	 */
 	cout << "Foundries providing auth token " << endl;
 	string token = get_oauth_token(opt.factory, opt.uuid);
+	if (token.empty())
+		return -1;
 	string token_base64;
 
 	token_base64.resize(b64::encoded_size(token.size()));
 	b64::encode(&token_base64[0], token.data(), token.size());
 
 	headers["Authorization"] = "Bearer " + token_base64;
+	return 0;
 }
 
+/* Register device using the oauth token. Token need "devices:create" scope */
 int auth_register_device(http_headers &headers, ptree &device, ptree &resp)
 {
 	const char *api = std::getenv(ENV_DEVICE_API);
@@ -111,17 +127,54 @@ int auth_register_device(http_headers &headers, ptree &device, ptree &resp)
 	write_json(data, device);
 	code = Curl(api).Post(headers, data.str(), resp);
 	if (code != 201) {
-		cerr << "Unable to create device: HTTP_" << code << endl;
-		if (resp.data().length())
-			cerr << resp.data() << endl;
-
-		for (auto it: resp)
-			cerr << it.first << ": " << it.second.data() << endl;
-
+		dump_resp_error("Unable to create device", code, resp);
 		return -1;
 	}
 
 	return 0;
+}
+
+/*
+ * Unregister device using the oauth token. Token need "devices:delete" and
+ * "devices:read-update" scope
+ */
+int auth_unregister_device(lmp_options &opt, http_headers &headers)
+{
+	const char *api = std::getenv(ENV_DEVICE_API);
+	gint64 code;
+	ptree resp;
+	int ret = 0;
+
+	if (api == nullptr)
+		api = DEVICE_API;
+
+	/* Remove device from devices list */
+	string url = api + opt.name + "/?factory=" + opt.factory;
+	code = Curl(url).Delete(headers, resp);
+	if (code != 200 && code != 404) {
+		dump_resp_error("Unable to delete device", code, resp);
+		ret = -1;
+	} else if (code == 200) {
+		cout << "Successfully unregistered device" << endl;
+	}
+
+	/* Remove "/devices" from api url */
+	string api_no_devices = api;
+	const string substring = "/devices";
+	std::size_t ind = api_no_devices.find(substring);
+	if (ind !=std::string::npos)
+		api_no_devices.erase(ind, substring.length());
+
+	/* Remove device UUID from denied-devices list */
+	url = string(api_no_devices) + "factories/" + opt.factory
+	      + "/denied-devices/" + opt.uuid + "/";
+	code = Curl(url).Delete(headers, resp);
+	if (code != 200 && code != 404) {
+		dump_resp_error("Unable to delete denied-device", code, resp);
+		ret = -1;
+	}
+
+	return ret;
 }
 
 int auth_ping_server(void)

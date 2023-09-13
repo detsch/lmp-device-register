@@ -110,7 +110,7 @@ public:
 		CURLcode res = curl_easy_perform(curl);
 		if (res != CURLE_OK) {
 			cerr << "Unable to post to " << _url << ": " << curl_easy_strerror(res) << endl;
-			exit(1);
+			return -1;
 		}
 
 		if (chunk != nullptr) {
@@ -121,11 +121,48 @@ public:
 		res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
 		if (res != CURLE_OK) {
 			cerr << "Unable to get curl info: " << curl_easy_strerror(res) << endl;
-			exit(1);
+			return -1;
 		}
 		ParseResponse(body, resp);
 		return code;
 	}
+	gint64 Delete(const http_headers &headers, ptree &resp)
+	{
+		stringstream body;
+		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, &write_sstream);
+		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &body);
+		curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+
+		struct curl_slist *chunk = nullptr;
+		for (auto item : headers) {
+			string header = item.first + ": " + item.second;
+			chunk = curl_slist_append(chunk, header.c_str());
+		}
+
+		if (chunk != nullptr) {
+			curl_easy_setopt(curl, CURLOPT_HTTPHEADER, chunk);
+		}
+
+		CURLcode res = curl_easy_perform(curl);
+		if (res != CURLE_OK) {
+			cerr << "Unable to post to " << _url << ": " << curl_easy_strerror(res) << endl;
+			return -1;
+		}
+
+		if (chunk != nullptr) {
+			curl_slist_free_all(chunk);
+		}
+
+		gint64 code = 0;
+		res = curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+		if (res != CURLE_OK) {
+			cerr << "Unable to get curl info: " << curl_easy_strerror(res) << endl;
+			return -1;
+		}
+		ParseResponse(body, resp);
+		return code;
+	}
+
 private:
 	CURL *curl = nullptr;
 };
